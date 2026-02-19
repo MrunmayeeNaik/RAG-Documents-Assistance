@@ -39,23 +39,34 @@ Important: Base your entire response solely on the information provided in the c
 """
 
 
-def process_document(uploaded_file:UploadedFile) -> list[Document]:
-    file_extensions ='.pdf'
-    
-    with tempfile.NamedTemporaryFile("wb",suffix=file_extensions,delete=False) as temp_file:
-        temp_file.write(uploaded_file.read())
+def process_document(uploaded_file: UploadedFile) -> list[Document]:
+    data = uploaded_file.read()
+    if not data:
+        raise ValueError("The file is empty. Please upload a file with content.")
+
+    file_extensions = ".pdf"
+    with tempfile.NamedTemporaryFile("wb", suffix=file_extensions, delete=False) as temp_file:
+        temp_file.write(data)
         temp_path = temp_file.name
+
     try:
-        loader =PyMuPDFLoader(temp_file.name)
-        docs=loader.load()
-        text_splitter =RecursiveCharacterTextSplitter(
+        try:
+            loader = PyMuPDFLoader(temp_path)
+            docs = loader.load()
+        except Exception:
+            raise ValueError(
+                "The file could not be read. It may be corrupted or in an unsupported format."
+            ) from None
+
+        text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=300,
             chunk_overlap=50,
-            separators=["\n\n","",".","?","!", ""," "]
+            separators=["\n\n", "", ".", "?", "!", "", " "],
         )
         return text_splitter.split_documents(docs)
     finally:
-        os.remove(temp_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 # Function for Vector Database
 def get_vector_collection() ->chromadb.Collection:
@@ -73,15 +84,23 @@ def get_vector_collection() ->chromadb.Collection:
 
 #function to store document in vector collection
 def add_to_vector_collection(all_splits:list[Document],file_name:str):
-    collection =get_vector_collection()
-    documents, metadatas,ids = [],[],[]
-    
-    for idx,split in enumerate(all_splits):
-        documents.append(split.page_content)
-        metadatas.append(split.metadata)
-        ids.append(f"{file_name}_{idx}")
-    
-    #to check for existing data and if not create one
+    if not all_splits:
+        st.error("No text could be extracted from this document. Ensure it's a valid PDF with readable (selectable) text.")
+        return
+
+    collection = get_vector_collection()
+    documents, metadatas, ids = [], [], []
+
+    for idx, split in enumerate(all_splits):
+        if split.page_content.strip():  # skip empty chunks
+            documents.append(split.page_content)
+            metadatas.append(split.metadata)
+            ids.append(f"{file_name}_{idx}")
+
+    if not documents:
+        st.error("No text could be extracted from this document. The PDF may be image-only (scanned) or empty.")
+        return
+
     collection.upsert(
         documents=documents,
         metadatas=metadatas,
@@ -112,9 +131,9 @@ def call_llm(context:str, prompt:str):
         ],
     )
     for chunk in response:
-        if chunk["done"] is False:
+        if chunk.get("message", {}).get("content"):
             yield chunk["message"]["content"]
-        else:
+        if chunk.get("done"):
             break
 
 
@@ -128,22 +147,32 @@ if __name__ == "__main__":
     if uploaded_file is not None:
         st.sidebar.write("📄 File uploaded:", uploaded_file.name)
 
-    if uploaded_file and process: 
+    if uploaded_file and process:
         normalize_uploaded_file_name = uploaded_file.name.translate(
-            str.maketrans({"-":"_",".":"_"})
-        ) 
-        all_splits=process_document(uploaded_file)
-        add_to_vector_collection(all_splits, normalize_uploaded_file_name)
-    else:
+            str.maketrans({"-": "_", ".": "_"})
+        )
+        try:
+            all_splits = process_document(uploaded_file)
+            add_to_vector_collection(all_splits, normalize_uploaded_file_name)
+        except ValueError as e:
+            st.error(str(e))
+    elif process and not uploaded_file:
         st.error("Please upload a file")
 
     prompt=st.text_area("*Ask a question related to your document:*")
     ask=st.button("Ask")
 
     if ask and prompt:
-        results = query_collection(prompt)
-        context = results.get("documents")[0]
-        response = call_llm(context=context, prompt=prompt)
-        st.write_stream(response)
+        try:
+            results = query_collection(prompt)
+            docs = results.get("documents") or []
+            if not docs or not docs[0]:
+                st.warning("No relevant context found. Make sure you've processed a document first.")
+            else:
+                context = "\n\n".join(docs[0])  # join chunks into single string
+                response = call_llm(context=context, prompt=prompt)
+                st.write_stream(response)
+        except Exception as e:
+            st.error(f"Error generating response: {e}")
 
     
